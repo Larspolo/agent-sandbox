@@ -1,0 +1,134 @@
+# Steering the agent
+
+The agent (Claude Code) works on this project automatically. You steer it asynchronously through GitHub
+Issues. You can do all of this in the GitHub app on your phone.
+`docs/SYSTEM.md` describes the whole system: its parts, the locks, the pacing and your setup steps.
+
+## How the agent works
+
+Each run does one work cycle (the `autopilot` skill):
+
+1. It reads your new comments on issues and PRs, and does what they ask.
+2. It sorts new issues: priority, kind and size labels. It splits large tickets.
+3. It does the top ticket: code, tests, a PR. It merges the PR when CI passes.
+4. It reports on the **Agent status** issue (label `agent-status`) with a short comment. GitHub sends you a
+   notification. The dashboard in the issue body is generated from GitHub (`tools/dashboard.py`, workflow
+   `Dashboard`): waiting for you, working on, next up, recently done. It updates on each label change and every
+   hour. Runs only add the process changes.
+5. It improves its own process: it writes learnings, corrects its instructions and makes tooling tickets.
+   One run per review slot (45 minutes, longer when there is nothing large to improve), the `improve` skill measures the runs (minutes, CI rounds, time sinks) and makes one larger
+   improvement. The status issue lists each process change.
+
+The agent takes instructions only from comments and issues by `Larspolo`.
+
+## What you can do
+
+| You want to | Do this |
+|---|---|
+| Add a ticket | New issue → **Ticket** form. One or two sentences are enough. |
+| Do a ticket next | Give it label `P0`, or comment "do this next". |
+| Change a priority | Change the label (`P0` do next, `P1` high, `P2` normal, `P3` later). |
+| Give feedback | Comment on the ticket, on the PR, or on the status issue. |
+| Reject merged work | Comment on the merged PR. The agent makes a follow-up ticket. |
+| Answer a question | Answer in the `needs-human` ticket. The agent removes the label. |
+| Answer the tickets that wait for you | Run `/human` in Claude Code on your computer, in a clone of the repository. It lists the `needs-human` tickets, prepares the world, the server or the options, guides you step by step and writes your answer on the ticket. Keep the session open: `/human` can wait for the next `needs-human` ticket and shows it when it opens (#1025). |
+| Do a task that the agent cannot do | The agent asks on the issue: label `needs-human` and a comment that mentions you. Do it, then comment. |
+| Stop the agent | Add label `paused` to the status issue. Remove it to continue. |
+| Cancel a ticket | Close it as "not planned". |
+| Mute a ticket until later | Add the label `muted`. No agent works on it (also not on a muted epic), and "Waiting for you" hides it. Remove the label to bring it back. |
+| Reject a process change | Comment on the status issue. The agent reverts it and notes why. |
+| Ask for a process review | Comment "process review" on the status issue. |
+| Check or repair the start of the runs | Start a session at claude.ai/code and type `/operator`. It checks the scheduled tasks, the pacer session, the quota, CI and the labels, and repairs them after you agree. A long-lived owner session is not necessary. |
+
+Order of work: `P0` → `P1` → `P2` → `P3`. With the same priority, the lowest issue number goes first.
+Tickets with `needs-human`, `blocked`, `muted` or `epic` wait. A ticket that depends on a muted ticket waits too.
+
+The agent asks you only on GitHub: on the issue that needs the answer, with the label `needs-human` and a
+comment that mentions `@Larspolo` (#862). It does not ask with phone notifications or only in the status report.
+
+## Labels
+
+- Priority: `P0`, `P1`, `P2`, `P3`
+- Size: `size:S`, `size:M`, `size:L` (L tickets are split before work starts)
+- Kind: `bug`, `feature`, `tooling`, `design`, `docs`, `cleanup`
+- Flow: `needs-human`, `blocked`, `muted`, `in-progress`, `epic`, `agent-status`, `paused`
+
+The file `.github/labels.txt` defines the labels. The Labels workflow creates them on `main`.
+
+## Where the agent runs
+
+- **Scheduled cloud runs** (recommended): a scheduled task in Claude Code on the web starts a new session on
+  a timer. Each run uses your Max quota. Change or stop the schedule at claude.ai/code (scheduled tasks).
+  The scheduled task must have the repository `Larspolo/agent-sandbox`. Without it, the runs cannot clone the code.
+  To set it: open claude.ai/code/routines → the task → menu next to its name → **Edit** → **Advanced
+  settings** → **General** → **Repository** → `Larspolo/agent-sandbox`. Below it, select the **Cloud environment**
+  that allows the Mojang hosts. Select the model in the model selector of the prompt box. **Save changes**.
+  More runs can work at the same time (start them with **Run now**). They claim tickets with a comment, so two
+  runs do not do the same ticket. With the argument `max`, a run continues until no ticket is ready, and it
+  starts a fresh run when its context is half full. To stop all runs: add `paused` to the status issue.
+- **On your computer**: `scripts/autopilot.sh 3` runs 3 cycles, one ticket each.
+  It needs the Claude Code CLI and the GitHub CLI (`gh auth login`).
+- **By hand**: open a Claude Code session in this repository and type `/autopilot`.
+
+## Network for Minecraft tests
+
+The agent starts a headless Minecraft server for tests. For this, the environment allows these hosts
+(done in #12; cloud environment menu in the session title bar → Edit → Network access → Allowed domains):
+
+    piston-meta.mojang.com
+    piston-data.mojang.com
+    libraries.minecraft.net
+
+Keep "Allow package managers" on. Steps: https://code.claude.com/docs/en/cloud-environments#network-access
+
+## Setup script (faster start)
+
+Use one cloud environment for all runs. All tickets use the same tools.
+`scripts/cloud-setup.sh` installs Java 25, the Python packages and the Minecraft server jars.
+The cloud keeps the result as a snapshot for about 7 days, or until you change the script or the network
+settings. Then the script runs again one time. To use it: cloud environment menu in the session title bar → Edit →
+**Setup script** → paste the content of `scripts/cloud-setup.sh` → **Save**. When the file changes, the agent
+sees it at the start of a session (the SessionStart hook compares `SETUP_VERSION`) and opens a `needs-human`
+ticket that asks you to paste it again.
+
+The agent also improves CI, this script and the other parts of the system by itself (`improve` skill). For settings
+that only you can change (the environment, the network, the scheduled task, GitHub), it opens a `needs-human`
+ticket with numbered steps.
+
+## Pacing (no steering needed)
+
+The runs are paced without you. `tools/usage.py` reads the usage of your subscription (the 5-hour and 7-day windows,
+as the Claude Code CLI reports them) and computes the number of runs: fast to 90 % of the 5-hour window 2 hours before
+its reset, then slower to 98 % at the reset (your decision, 2026-10-26), and not the week faster than it passes.
+You do not need to send percentages.
+A run of the scheduled task cannot start other runs (#566). So one pacer session ("agent-sandbox pacer", skill `pacer`)
+runs `python3 tools/usage.py --fire` every 10 minutes and starts the runs that the target misses (at most 4 at a
+time). The scheduled task also starts one run each hour. To stop all runs: add `paused` to the status issue.
+
+## CI and the merge
+
+The repository is public, so GitHub Actions minutes are free (#370). CI runs only the quick checks on each PR (lint
+and fast tests, about 1 minute), so that a PR merges soon. The full suite (slow tests, Minecraft tests, package)
+runs each night on `main` (your decision, 2026-10-26); start it by hand with Actions → CI → Run workflow → "full".
+The runs do the slow and Minecraft checks that a change needs in their own session. The workflow `automerge.yml`
+merges an agent PR when its CI is green. It does not merge a PR with the label `hold`, or a PR whose ticket has `needs-human` or
+`blocked`. After each merge it starts CI on `main`; a red run on `main` opens a `P0` ticket, and the runs fix it first.
+To stop one PR, add `hold` to it. To stop all runs, add `paused` to the status issue.
+The ruleset `Protect main` (Settings → Rules) refuses force pushes and deletes of `main`.
+
+## Files that steer the agent
+
+| File | Content |
+|---|---|
+| `CLAUDE.md` | Project guide and rules. Every session reads it. |
+| `docs/LEARNINGS.md` | What the agent learned. It updates this file itself. |
+| `docs/PRINCIPLES.md` | The direction of the project, made from your decisions. The agents recommend by it, and tell you when an answer goes against it. Edit it to change the direction. |
+| `docs/DECISIONS.md` | The log of your decisions. The agents add a line for each answer. |
+| `docs/ROADMAP.md` | The features of the three goals (done or missing). Add a line to get a feature built: the agents make an epic from it (`roadmap` skill). |
+| `.claude/skills/autopilot/` | The work cycle. |
+| `.claude/skills/verify/` | How to test a change. |
+| `.claude/skills/ticket/` | How to write and split tickets. |
+| `.claude/skills/improve/` | How the agent measures and improves its own process. |
+| `.claude/skills/roadmap/` | How the agent makes epics from the roadmap and reviews it. |
+
+You can edit these files. The agent follows the version on `main`.

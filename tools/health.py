@@ -1,0 +1,650 @@
+"""Numbers of the whole system for the `improve` skill: CI, environment, repository and scheduling (#242).
+
+    python3 tools/health.py              # the last 24 hours
+    python3 tools/health.py --hours 72
+    python3 tools/health.py --hours 24 --until 2026-10-26T05:15:00Z   # the 24 hours before a time (#489)
+    python3 tools/health.py --hours 6 --compare                        # the last 6 hours next to the 6 before (#1697)
+    python3 tools/health.py --takeovers  # each takeover: the old run, its last report and the cause (#1703)
+
+REST only (cloud sessions give 403 for GraphQL and `search/...`). Token and `gh` fallback as in
+`tools/dashboard.py`. The parsing functions take plain JSON, so the tests need no network.
+"""
+import argparse
+import datetime
+import difflib
+import os
+import re
+import statistics
+import subprocess
+import sys
+from collections import Counter
+
+import numpy
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from agent_config import CONFIG  # noqa: E402
+from dashboard import api, closes  # noqa: E402
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+CI_JOB_RUNS = 20                          # read the step times of this many CI runs (one API call each)
+DENY = (".log", ".mca", ".png")           # suffixes that do not belong in git ...
+DENY_OK = ("docs/", "samples/")           # ... except .png in these folders
+BIG = 1 << 20
+OWNER = CONFIG["owner"]                   # a reopen by the owner is rework (#899)
+STATUS = CONFIG["status"]["label"]
+
+
+def ts(s):
+    return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def minutes(a, b):
+    return (ts(b) - ts(a)).total_seconds() / 60
+
+
+def med(xs):
+    return statistics.median(xs) if xs else None
+
+
+def ci_runs(runs, since):
+    """{workflow: (count, median min, max min, failures)} of the completed runs that started after `since`."""
+    by = {}
+    for r in runs:
+        if r.get("status") == "completed" and ts(r["run_started_at"]) >= since:
+            by.setdefault(r["name"], []).append(r)
+    out = {}
+    for name, rs in sorted(by.items()):
+        m = [minutes(r["run_started_at"], r["updated_at"]) for r in rs]
+        out[name] = (len(rs), med(m), max(m), sum(r["conclusion"] == "failure" for r in rs))
+    return out
+
+
+def slow_steps(jobs, n=3):
+    """[(median min, "job / step")] of the n slowest steps over all jobs (the `jobs` lists of several runs)."""
+    times = {}
+    for job in jobs:
+        for s in job.get("steps", []):
+            if s.get("started_at") and s.get("completed_at"):
+                times.setdefault(f"{job['name']} / {s['name']}", []).append(
+                    minutes(s["started_at"], s["completed_at"]))
+    return sorted(((med(v), k) for k, v in times.items()), reverse=True)[:n]
+
+
+def setup_minutes(comments):
+    """The `setup <m> min` values of the `Metrics:` lines."""
+    return [float(m) for c in comments for line in (c.get("body") or "").splitlines() if line.startswith("Metrics:")
+            for m in re.findall(r"setup (\d+(?:\.\d+)?) min", line)]
+
+
+def events(comments):
+    """Counts of takeovers, releases and merge conflicts in the issue and PR comments. A conflict counts only from
+    the comments of the workflows: Automerge could not merge, or Unconflict solved it alone ("solved"). Run reports
+    that only name a conflict counted 5 times too many (improve, run 145)."""
+    bodies = [(c.get("body") or "").lstrip() for c in comments]
+    return {"takeovers": sum(b.startswith("Taken over by") for b in bodies),
+            "releases": sum(b.startswith("Released") for b in bodies),
+            "conflicts": sum(b.startswith("CI is green, but the merge failed") for b in bodies),
+            "solved": sum(b.startswith("Merged `main` into the branch") for b in bodies)}
+
+
+def claim_to_merge(prs, comments, since):
+    """Minutes from the last "Started by" comment on the ticket to the merge, for PRs merged after `since`."""
+    started = {}
+    for c in comments:
+        if (c.get("body") or "").startswith("Started by"):
+            n = int(c["issue_url"].rsplit("/", 1)[1])
+            started.setdefault(n, []).append(c["created_at"])
+    out = []
+    for pr in prs:
+        if pr.get("merged_at") and ts(pr["merged_at"]) >= since:
+            for n in closes(pr):
+                before = [t for t in started.get(n, []) if t <= pr["merged_at"]]
+                if before:
+                    out.append(minutes(max(before), pr["merged_at"]))
+    return out
+
+
+def bad_files(files):
+    """[(path, bytes)] of the files over 1 MB or with a denied suffix. files: [(path, bytes)]."""
+    return [(p, size) for p, size in files if size > BIG
+            or (p.endswith(DENY) and not (p.endswith(".png") and p.startswith(DENY_OK)))]
+
+
+# `runs N` since #635 (claim beats); the older `claims N` lines counted too few runs, so they do not count.
+SAMPLE = re.compile(r"^Usage: (\S+) · usage (\d+(?:\.\d+)?)% · resets (\S+) · runs (\d+)", re.M)
+
+
+LANES = CONFIG.get("pacing", {}).get("weights", {"haiku": 0.25})   # start weight of a lane run in Opus runs (#1727)
+
+
+def lane_runs(line):
+    """{lane: runs} of the lane fields of a `Usage:` line (`· haiku 2`, #1727)."""
+    return {k: int(v) for k, v in re.findall(r"· (\w+) (\d+)(?= ·|$)", line) if k in LANES}
+
+
+def usage_lines(comments):
+    return [line for c in comments for line in (c.get("body") or "").splitlines() if line.startswith("Usage:")]
+
+
+def raw_samples(comments):
+    """[(time, 5-hour usage 0..1, reset time, all claims, {lane: claims})] of the `Usage:` lines, by time."""
+    return sorted((ts(m[1]), float(m[2]) / 100, ts(m[3]), int(m[4]), lane_runs(line))
+                  for line in usage_lines(comments) for m in [SAMPLE.match(line)] if m)
+
+
+def lane_weights(comments, need=10):
+    """({lane: weight}, {lane: "measured" or "start"}): the quota of one lane run in Opus runs. Least squares of the
+    5-hour usage rise of each interval on its Opus and lane claim-hours; a lane with fewer than `need` intervals with
+    its runs keeps the start weight of `agent.toml` (#1727)."""
+    rows = []
+    for a, b in zip(raw_samples(comments), raw_samples(comments)[1:]):
+        h = (b[0] - a[0]).total_seconds() / 3600
+        if abs((b[2] - a[2]).total_seconds()) < 600 and b[1] >= a[1] and h > 0:
+            lane = {k: h * (a[4].get(k, 0) + b[4].get(k, 0)) / 2 for k in LANES}
+            rows.append((b[1] - a[1], h * (a[3] + b[3]) / 2 - sum(lane.values()), lane))
+    fit = [k for k in LANES if sum(r[2][k] > 0 for r in rows) >= need]
+    weights, source = dict(LANES), dict.fromkeys(LANES, "start")
+    if fit and sum(r[1] > 0 for r in rows) >= need:
+        x = numpy.array([[r[1]] + [r[2][k] for k in fit] for r in rows])
+        b = numpy.linalg.lstsq(x, numpy.array([r[0] for r in rows]), rcond=None)[0]
+        if b[0] > 0:
+            for k, v in zip(fit, b[1:]):
+                weights[k], source[k] = min(max(v / b[0], 0.02), 1.0), "measured"
+    return weights, source
+
+
+def opus_equivalent(claims, lanes, weights):
+    """The claims of a sample in Opus runs: a lane run counts its weight."""
+    return claims - sum(lanes.values()) + sum(weights.get(k, 1.0) * n for k, n in lanes.items())
+
+
+def samples(comments, weights=None):
+    """[(time, 5-hour usage 0..1, reset time, claims in Opus runs)] of the `Usage:` lines of the run reports (#462),
+    by time. A Haiku run counts its weight (#1727): else 2 hours of Haiku runs look like a plan upgrade (`ratio`)."""
+    weights = weights or lane_weights(comments)[0]
+    return [(t, u, r, opus_equivalent(k, lanes, weights)) for t, u, r, k, lanes in raw_samples(comments)]
+
+
+def burn_pairs(samples, min_hours=0.25):
+    """Share of the 5-hour quota that one run uses per hour, from each sample and the first later sample in the same
+    window (the same reset time) at least `min_hours` later: the rise of the usage divided by the hours and the mean
+    number of claims. Runs report a few minutes apart, so neighbours alone give almost no pairs (#571)."""
+    out = []
+    for i, a in enumerate(samples):
+        b = next((b for b in samples[i + 1:] if abs((b[2] - a[2]).total_seconds()) < 600
+                  and (b[0] - a[0]).total_seconds() >= min_hours * 3600), None)
+        if b and b[1] >= a[1] and a[3] + b[3] > 0:
+            out.append((b[1] - a[1]) / ((b[0] - a[0]).total_seconds() / 3600) / ((a[3] + b[3]) / 2))
+    return out
+
+
+def burn_ratio(samples, need=5):
+    """Share of the 5-hour quota that one run uses per hour: the sum of the usage rises divided by the sum of the
+    claim-hours (hours x mean claims) of consecutive samples in the same window, or None with fewer than `need` such
+    intervals. Not a median of pairs: a pair with few claims gives a large value, because the runs between tickets
+    and the other sessions also use the quota (0.111 against 0.059 on 2026-10-26, #582)."""
+    out = []
+    for a, b in zip(samples, samples[1:]):
+        h = (b[0] - a[0]).total_seconds() / 3600
+        if abs((b[2] - a[2]).total_seconds()) < 600 and b[1] >= a[1] and h > 0 and a[3] + b[3] > 0:
+            out.append((b[0], b[1] - a[1], h * (a[3] + b[3]) / 2))
+    return ratio(out, need)
+
+
+DROP_HOURS = 2      # the period that shows a plan upgrade in the burn (#1706)
+
+
+def ratio(intervals, need):
+    """The sum of the rises divided by the sum of the claim-hours of the intervals [(end, rise, claim-hours)], or None
+    with fewer than `need`. When the intervals of the last DROP_HOURS (at least `need`) give less than half of that,
+    only they count: after a plan upgrade a run uses a smaller share of the larger quota at once, and the old intervals
+    would keep the target too low for a day (#1706)."""
+    def of(iv):
+        return sum(r for _, r, _ in iv) / sum(c for _, _, c in iv) if len(iv) >= need else None
+    whole = of(intervals)
+    if whole:
+        end = max(t for t, _, _ in intervals) - datetime.timedelta(hours=DROP_HOURS)
+        last = of([i for i in intervals if i[0] > end])
+        if last and last < whole / 2:
+            return last
+    return whole
+
+
+WEEK_RUNS = re.compile(r"^Usage: (\S+) · .*?· runs (\d+) · week (\d+(?:\.\d+)?)%", re.M)
+
+
+def weekly_burn(comments, now, hours=24, need=5):
+    """Share of the 7-day quota that one run uses per hour (#1695): the sum of the rises of the 7-day usage of
+    consecutive `Usage:` lines of the last `hours`, divided by their claim-hours, as burn_ratio. A drop is the 7-day
+    reset. None with fewer than `need` intervals. A plan upgrade: `ratio`."""
+    weights = lane_weights(comments)[0]                        # a Haiku run counts its weight (#1727)
+    pts = sorted((ts(m[1]), opus_equivalent(int(m[2]), lane_runs(line), weights), float(m[3]) / 100)
+                 for line in usage_lines(comments) for m in [WEEK_RUNS.match(line)] if m)
+    pts = [p for p in pts if p[0] >= now - datetime.timedelta(hours=hours)]
+    out = [(b[0], b[2] - a[2], (b[0] - a[0]).total_seconds() / 3600 * (a[1] + b[1]) / 2) for a, b in zip(pts, pts[1:])
+           if b[2] >= a[2] and b[0] > a[0] and a[1] + b[1] > 0]
+    return ratio(out, need) or None
+
+
+def measured_burn(comments, now, hours=24, need=5):
+    """The burn ratio of the samples of the last `hours`, or None when there are fewer than `need` intervals."""
+    return burn_ratio([s for s in samples(comments) if s[0] >= now - datetime.timedelta(hours=hours)], need)
+
+
+PHASES = ("read", "claim", "code", "verify", "ci", "conflict", "report")    # the phase minutes of a Metrics line (#899)
+WEEK = re.compile(r"^Usage: (\S+) · .*?· week (\d+(?:\.\d+)?)%(?: · release (\d+(?:\.\d+)?)%)?", re.M)
+
+
+def phase_minutes(comments):
+    """{phase: minutes} summed over the `phases read N · claim N ...` parts of the `Metrics:` lines. Old lines have no
+    phases and add nothing."""
+    out = dict.fromkeys(PHASES, 0.0)
+    for c in comments:
+        for line in (c.get("body") or "").splitlines():
+            if line.startswith("Metrics:") and " phases " in line:
+                for k, v in re.findall(r"\b([a-z]+) (\d+(?:\.\d+)?)\b", line.split(" phases ", 1)[1]):
+                    if k in out:
+                        out[k] += float(v)
+    return out
+
+
+def quota_per_merge(samples, merged):
+    """The rise of the 5-hour usage (0..1) over the samples, summed over consecutive samples in the same window, per
+    merged PR; None without merges or rises."""
+    rise = sum(b[1] - a[1] for a, b in zip(samples, samples[1:])
+               if abs((b[2] - a[2]).total_seconds()) < 600 and b[1] >= a[1])
+    return rise / merged if merged and rise else None
+
+
+TOKENS = re.compile(r"^Tokens: (\d+(?:\.\d+)?)M eq · .*?· sinks (.*)$", re.M)
+
+
+def token_lines(comments):
+    """[(M eq, {sink: share 0..1})] of the `Tokens:` lines of the run reports (tools/tokens.py, owner 2026-10-27)."""
+    return [(float(m), {k: float(v) / 100 for k, v in re.findall(r"(\S.*?) (\d+)%(?:, |$)", sinks)})
+            for c in comments for m, sinks in TOKENS.findall(c.get("body") or "")]
+
+
+def token_sinks(lines, k=6):
+    """[(sink, share of all eq)] of the k largest sinks over the `Tokens:` lines: the token bottleneck."""
+    total, by = sum(m for m, _ in lines), {}
+    for m, sinks in lines:
+        for s, x in sinks.items():
+            by[s] = by.get(s, 0) + m * x
+    return sorted(((s, x / total) for s, x in by.items()), key=lambda kv: -kv[1])[:k] if total else []
+
+
+VERIFY = re.compile(r"^Tokens: .*? · verify (.*?) · sinks ", re.M)
+
+
+def verify_minutes(comments):
+    """{check kind: (minutes, count)} summed over the `verify` fields of the `Tokens:` lines (tools/tokens.py, #1704)."""
+    out = {}
+    for c in comments:
+        for field in VERIFY.findall(c.get("body") or ""):
+            for k, m, n in re.findall(r"(\S.*?) (\d+(?:\.\d+)?)m (\d+)x(?:, |$)", field):
+                a, b = out.get(k, (0.0, 0))
+                out[k] = (a + float(m), b + int(n))
+    return out
+
+
+def weekly(comments):
+    """[(time, 7-day usage %, release % or None)] of the `Usage:` lines that have the week (usage.py --sample), by time."""
+    return sorted((ts(t), float(w), float(r) if r else None) for c in comments for t, w, r in WEEK.findall(c.get("body") or ""))
+
+
+def release_per_week(points):
+    """(release points per 1 % of 7-day quota, first release %, last release %) from weekly(), or None. The quota is
+    the sum of the rises of the 7-day usage (a drop is its reset)."""
+    pts = [p for p in points if p[2] is not None]
+    used = sum(b[1] - a[1] for a, b in zip(pts, pts[1:]) if b[1] > a[1])
+    return ((pts[-1][2] - pts[0][2]) / used, pts[0][2], pts[-1][2]) if len(pts) > 1 and used else None
+
+
+def weak_spots(issues, events, prs, runs, since):
+    """Counts that cost quality: issues that the owner reopened, bug tickets that name a PR merged since `since`
+    (rework), bug tickets that name a check ticket ("Check ..."), and failed night runs of CI."""
+    new = [i for i in issues if "pull_request" not in i and ts(i["created_at"]) >= since]
+    bugs = [i for i in new if "bug" in {lb["name"] for lb in i.get("labels", [])}]
+    merged = {p["number"] for p in prs if p.get("merged_at") and ts(p["merged_at"]) >= since}
+    checks = {i["number"] for i in issues if i["title"].startswith("Check ")}
+    named = lambda i: {int(n) for n in re.findall(r"#(\d+)", i.get("body") or "")}
+    return {"reopened": sum(e["event"] == "reopened" and (e.get("actor") or {}).get("login") == OWNER
+                            and ts(e["created_at"]) >= since for e in events),
+            "rework": sum(bool(named(i) & merged) for i in bugs),
+            "check bugs": sum(bool(named(i) & checks) for i in bugs),
+            "red nights": sum(r["name"] == "CI" and r.get("event") == "schedule" and r.get("conclusion") == "failure"
+                              and ts(r["run_started_at"]) >= since for r in runs)}
+
+
+def status_comments(hours=24):
+    """The comments on the status issue of the last `hours`."""
+    status = api(f"issues?state=open&labels={STATUS}")
+    since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)
+    return api_pages(f"issues/{status[0]['number']}/comments?since={since:%Y-%m-%dT%H:%M:%SZ}") if status else []
+
+
+def count_beating(lines, now, minutes=25):
+    """The tickets whose claim ref (top slot `N` or `N-k`) had a claim or beat in the last `minutes` and is not
+    released. `lines`: "<slot> <commit time> <subject>" of the refs claim/<slot>."""
+    return sum(count_lanes(lines, now, minutes).values())
+
+
+def count_lanes(lines, now, minutes=25):
+    """{lane: beating claims}: the lane is the ` lane NAME` at the end of the last claim or beat message, else
+    "opus" (#1727)."""
+    top = {}
+    for line in lines:
+        slot, t, subject = (line.split(" ", 2) + [""])[:3]
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", slot)
+        if m and t.isdigit():
+            n, k = int(m.group(1)), int(m.group(2) or 1)
+            if n not in top or k > top[n][0]:
+                top[n] = (k, int(t), subject)
+    cut = now.timestamp() - minutes * 60
+    out = {}
+    for _, t, s in top.values():
+        if t >= cut and not s.startswith("Release"):
+            name = re.search(r" lane (\w+)$", s)
+            out[name[1] if name else "opus"] = out.get(name[1] if name else "opus", 0) + 1
+    return out
+
+
+def beating_claims(now, minutes=25, remote="origin"):
+    """The runs that work now: runs beat at least every 20 minutes, also while they work long on one ticket and the
+    issue does not change (#635). None when git cannot read the claim refs."""
+    lanes = lane_claims(now, minutes, remote)
+    return None if lanes is None else sum(lanes.values())
+
+
+def claim_refs(remote="origin"):
+    """The lines `<key> <unix time of the last beat> <subject>` of the claim refs, or None when git cannot read them."""
+    git = lambda *a: subprocess.run(["git", *a], capture_output=True, text=True, cwd=ROOT)
+    if git("fetch", "-q", "--prune", remote, "+refs/heads/claim/*:refs/agent-sandbox-claims/*").returncode:
+        return None
+    out = git("for-each-ref", "refs/agent-sandbox-claims", "--format=%(refname:lstrip=2) %(committerdate:unix) %(subject)")
+    return out.stdout.splitlines() if out.returncode == 0 else None
+
+
+def lane_claims(now, minutes=25, remote="origin"):
+    """{lane: runs that work now} from the claim refs (#1727), or None when git cannot read them."""
+    lines = claim_refs(remote)
+    return None if lines is None else count_lanes(lines, now, minutes)
+
+
+def review_delays(lines):
+    """[(time, slot minutes, minutes late or None)] of the review locks `review-<minutes>m-<slot>` (tools/claim.py
+    --review, #898), by time. A slot opens one slot length after the review before it (#942): a run that takes it later
+    is late, for example when no run reaches step 9 of the autopilot (a usage limit)."""
+    got = sorted((int(t), int(m)) for k, t, *_ in (x.split(" ", 2) for x in lines)
+                 for m in re.findall(r"^review-(\d+)m-\d+$", k))
+    return [(datetime.datetime.fromtimestamp(t, datetime.timezone.utc), m,
+             None if i == 0 else round((t - got[i - 1][0]) / 60 - m)) for i, (t, m) in enumerate(got)]
+
+
+def active_claims(now, minutes=30):
+    """The runs that work now (rule 4 of the scheduled task): the claim beats, else the open tickets with
+    `in-progress` that changed in the last `minutes`."""
+    n = beating_claims(now)
+    if n is not None:
+        return n
+    return sum(ts(i["updated_at"]) >= now - datetime.timedelta(minutes=minutes)
+               for i in api("issues?state=open&labels=in-progress&per_page=100") if "pull_request" not in i)
+
+
+def lanes(comments):
+    """{lane: (runs, PRs, [minutes], [M eq])} of the run reports. The lane of a `Metrics:` line is its `· lane NAME`,
+    else "opus"; the M eq is the `Tokens:` line of the same comment (#1715)."""
+    out = {}
+    for c in comments:
+        body = c.get("body") or ""
+        tok = TOKENS.search(body)
+        for line in body.splitlines():
+            m = re.match(r"Metrics: ticket #\d+ · [^·]* · ([^·]*?) · (\d+(?:\.\d+)?) min", line)
+            if m:
+                lane = re.search(r"· lane (\w+)", line)
+                r = out.setdefault(lane[1] if lane else "opus", [0, 0, [], []])
+                r[0] += 1
+                r[1] += m[1].strip() == "merged" or m[1].startswith("pr #")
+                r[2].append(float(m[2]))
+                r[3] += [float(tok[1])] if tok else []
+    return {k: tuple(v) for k, v in out.items()}
+
+
+def pr_results(comments, prs):
+    """The `pr #n` results of the `Metrics:` lines: (merged PRs, not merged PRs) by the present PR state (#902)."""
+    merged = {p["number"] for p in prs if p.get("merged_at")}
+    ns = sorted({int(n) for c in comments for line in (c.get("body") or "").splitlines() if line.startswith("Metrics:")
+                 for n in re.findall(r"· pr #(\d+) ·", line)})
+    return [n for n in ns if n in merged], [n for n in ns if n not in merged]
+
+
+def fmt(x):
+    return "-" if x is None else f"{x:.1f}"
+
+
+def conflicted(comments):
+    """The numbers of the PRs that Automerge could not merge because of a merge conflict (events)."""
+    return sorted({int(c["issue_url"].rsplit("/", 1)[1]) for c in comments
+                   if (c.get("body") or "").lstrip().startswith("CI is green, but the merge failed")})
+
+
+def conflict_files(files_of, n=5):
+    """The n files that the most conflicted PRs change: where parallel tickets meet (files_of: PR -> file names)."""
+    return Counter(f for fs in files_of.values() for f in set(fs)).most_common(n)
+
+
+RUN = re.compile(r"^(?:Started|Taken over) by `([^`]+)`")
+CAUSES = ("quota", "merge conflict", "long mc test", "no report", "after the report")
+
+
+def takeovers(comments, status_comments, prs=(), since=None, full=0.95):
+    """[(time, item, old run, minutes since its last report or None, cause)] of the "Taken over by" comments (#1703).
+    The old run: the last other "Started by" or "Taken over by" branch on the item, its ticket or its PR, else the
+    PR branch. The first rule that matches gives the cause: a `Usage:` line at `full` or more after the old run
+    started (quota), an Automerge merge failure or "conflict" in the takeover text (merge conflict), `-m mc` in the
+    last report of the old run (long mc test), no report of the old run after its start (the session ended in the
+    ticket: no report), else the run reported and did not come back (after the report)."""
+    num = lambda c: int(c["issue_url"].rsplit("/", 1)[1])
+    by_pr = {p["number"]: p for p in prs}
+    out = []
+    for t in sorted((c for c in comments if (c.get("body") or "").lstrip().startswith("Taken over by")),
+                    key=lambda c: c["created_at"]):
+        when, item = t["created_at"], num(t)
+        if since is not None and ts(when) < since:
+            continue
+        rel = {item} | closes(by_pr.get(item, {})) | {n for n, p in by_pr.items() if item in closes(p)}
+        new = RUN.match(t["body"].lstrip())[1]
+        prior = [(c["created_at"], m[1]) for c in comments if num(c) in rel and c["created_at"] < when
+                 for m in [RUN.match((c.get("body") or "").lstrip())] if m and m[1] != new]
+        start, old = max(prior) if prior else (None, by_pr.get(item, {}).get("head", {}).get("ref", "?"))
+        after = lambda c: c["created_at"] < when and (start is None or c["created_at"] >= start)
+        reports = sorted((c for c in status_comments if after(c) and f"`{old}`" in (c.get("body") or "")),
+                         key=lambda c: c["created_at"])
+        last = reports[-1] if reports else None
+        if any(s[1] >= full for s in raw_samples([c for c in status_comments if after(c)])):
+            cause = "quota"
+        elif "conflict" in t["body"] or any(num(c) in rel and after(c) and (c.get("body") or "").lstrip().startswith(
+                "CI is green, but the merge failed") for c in comments):
+            cause = "merge conflict"
+        elif last and "-m mc" in last["body"]:
+            cause = "long mc test"
+        else:
+            cause = "after the report" if last else "no report"
+        out.append((when, item, old, None if last is None else round(minutes(last["created_at"], when)), cause))
+    return out
+
+
+def takeover_lines(rows):
+    """One line for each takeover and one line with the count of each cause."""
+    k = Counter(r[4] for r in rows)
+    return [f"  {w[:16].replace('T', ' ')} #{i} {old}: last report {'-' if m is None else f'{m} min'} before, {c}"
+            for w, i, old, m, c in rows] + \
+        ["Takeover causes: " + (", ".join(f"{c} {k[c]}" for c in CAUSES if k[c]) or "-")]
+
+
+def report(since, runs, jobs, status_comments, comments, prs, files, files_of=None, issues=(), issue_events=(),
+           unanswered=None, reviews=None):
+    out = [f"Health since {since:%Y-%m-%d %H:%M} UTC", "", "CI runs (count, median min, max min, failures):"]
+    for name, (k, m, mx, fail) in ci_runs(runs, since).items():
+        out.append(f"  {name}: {k}, {fmt(m)}, {fmt(mx)}, {fail}")
+    out.append("Slowest CI steps (median min): " + "; ".join(f"{k} {fmt(m)}" for m, k in slow_steps(jobs)))
+    setup = setup_minutes(status_comments)
+    out.append(f"Setup (median min of {len(setup)} Metrics lines): {fmt(med(setup))}")
+    ok, lost = pr_results(status_comments, prs)
+    out.append(f"Metrics lines with pr #n: merged {len(ok)}, not merged {len(lost)}"
+               + (f" ({', '.join(f'#{n}' for n in lost)})" if lost else ""))
+    e = events(comments)
+    out.append(f"Takeovers {e['takeovers']}, releases {e['releases']}, merge conflicts {e['conflicts']} (solved by Unconflict {e['solved']})")
+    out.append(takeover_lines(takeovers(comments, status_comments, prs, since))[-1])
+    if files_of:
+        out.append(f"Files of the {len(files_of)} conflicted PRs (PRs): "
+                   + "; ".join(f"{f} {k}" for f, k in conflict_files(files_of)))
+    s = [x for x in samples(status_comments) if x[0] >= since]
+    b, r = burn_pairs(s), burn_ratio(s)
+    out.append(f"Burn per run-hour (ratio of sums of {len(s)} Usage lines, used by usage.py): "
+               f"{'-' if r is None else f'{r:.3f}'} · median of {len(b)} pairs: {'-' if not b else f'{med(b):.3f}'}")
+    ph = phase_minutes(status_comments)
+    total = sum(ph.values())
+    out.append("Phases (min, share of the Metrics lines with phases): " + ("; ".join(
+        f"{k} {fmt(v)} ({v / total:.0%})" for k, v in ph.items()) if total else "-"))
+    merged = sum(1 for p in prs if p.get("merged_at") and ts(p["merged_at"]) >= since)
+    q = quota_per_merge(s, merged)
+    out.append(f"Quota per merged PR: {'-' if q is None else f'{q:.1%}'} of the 5-hour window ({merged} merged)")
+    tl = token_lines(status_comments)
+    out.append(f"Tokens per run (median of {len(tl)} Tokens lines): {fmt(med([m for m, _ in tl]))}M eq"
+               + (f" · per merged PR {sum(m for m, _ in tl) / len(ok):.2f}M eq" if tl and ok else "")
+               + " · largest sinks: " + ("; ".join(f"{s} {x:.0%}" for s, x in token_sinks(tl)) or "-"))
+    vm = sorted(verify_minutes(status_comments).items(), key=lambda kv: -kv[1][0])
+    out.append("Verify commands (min, count, of the Tokens lines with a verify field): "
+               + ("; ".join(f"{k} {fmt(m)} ({n}x)" for k, (m, n) in vm) or "-"))
+    for name, (n, pr, mins, eq) in sorted(lanes(status_comments).items()):
+        out.append(f"Lane {name}: {n} runs, {pr} PRs, median {fmt(med(mins))} min, median {fmt(med(eq))}M eq")
+    weights, source = lane_weights(status_comments)
+    out.append("Lane weights (a lane run in Opus runs, #1727): " + ", ".join(f"{k} {w:.2f} ({source[k]})" for k, w in weights.items()))
+    rw = release_per_week([p for p in weekly(status_comments) if p[0] >= since])
+    out.append("Release per 1 % of 7-day quota: " + ("-" if rw is None else
+               f"{rw[0]:.2f} points ({rw[1]:g} % to {rw[2]:g} %)"))
+    w = weak_spots(issues, issue_events, prs, runs, since)
+    out.append("Weak spots: " + ", ".join(f"{k} {v}" for k, v in w.items()))
+    if reviews is not None:                     # the self-improvement loop: each slot gets its review in time (#942)
+        out.append("Review slots (taken UTC, slot min, min late): " + ("; ".join(
+            f"{t:%m-%d %H:%M} {m} {'-' if late is None else f'{late:+d}'}" for t, m, late in reviews if t >= since) or "-"))
+    c2m = claim_to_merge(prs, comments, since)
+    out.append(f"Claim to merge (median min of {len(c2m)} PRs): {fmt(med(c2m))}")
+    bad = bad_files(files)
+    out.append(f"Files that do not belong in git: {len(bad)}")
+    out += [f"  {p} ({size // 1024} KiB)" for p, size in bad]
+    if unanswered is not None:                  # a quality number: each owner comment gets an answer (#971)
+        out.append(f"Owner comments without an answer (tools/feedback.py): {len(unanswered)}")
+    return "\n".join(out)
+
+
+def git_files():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    paths = subprocess.run(["git", "-C", root, "ls-files", "-z"], capture_output=True, text=True,
+                           check=True).stdout.split("\0")
+    return [(p, os.path.getsize(os.path.join(root, p))) for p in paths if p and os.path.isfile(os.path.join(root, p))]
+
+
+def fetch(since, until=None):
+    iso = f"{since:%Y-%m-%dT%H:%M:%SZ}"
+    created = f"{iso}..{until:%Y-%m-%dT%H:%M:%SZ}" if until else f">={iso}"   # the Dashboard runs fill 10 pages a day
+    runs = []
+    for page in range(1, 11):
+        rs = api(f"actions/runs?per_page=100&page={page}&created={created}")["workflow_runs"]
+        runs += rs
+        if len(rs) < 100:
+            break
+    ci = [r for r in runs if r["name"] == "CI" and r.get("status") == "completed"][:CI_JOB_RUNS]
+    jobs = [j for r in ci for j in api(f"actions/runs/{r['id']}/jobs")["jobs"]]
+    status = api(f"issues?state=open&labels={STATUS}")
+    # one day more: the "Started by" comment of a ticket that merged in the period can be older
+    comments = api_pages(f"issues/comments?since={since - datetime.timedelta(days=1):%Y-%m-%dT%H:%M:%SZ}")
+    status_comments = [c for c in comments if status and c["issue_url"].endswith(f"/{status[0]['number']}")
+                       and c["created_at"] >= iso]
+    recent = [c for c in comments if c["created_at"] >= iso or c["body"].startswith("Started by")]
+    prs = api_pages("pulls?state=closed&sort=updated&direction=desc", stop=lambda p: p["updated_at"] < iso)
+    issues = api_pages(f"issues?state=all&since={iso}")
+    events = api_pages("issues/events?", limit=5, stop=lambda e: e["created_at"] < iso)
+    return runs, jobs, status_comments, recent, prs, issues, events
+
+
+def clip(until, runs, status_comments, comments, prs, issues, events):
+    """The items up to `until`: a period in the past ends there (--until, #489). A PR that closed later was open."""
+    early = lambda t: t is not None and ts(t) < until
+    return ([r for r in runs if early(r["created_at"])], [c for c in status_comments if early(c["created_at"])],
+            [c for c in comments if early(c["created_at"])], [p for p in prs if early(p.get("closed_at"))],
+            [i for i in issues if early(i["created_at"])], [e for e in events if early(e["created_at"])])
+
+
+def api_pages(path, limit=20, stop=None):
+    out = []
+    for page in range(1, limit + 1):
+        items = api(f"{path}&per_page=100&page={page}")
+        out += items
+        if len(items) < 100 or (stop and stop(items[-1])):
+            break
+    return out
+
+
+def utc(s):
+    """An ISO time; a time without a zone is UTC (`--until 2026-10-27T01:00`, #1697)."""
+    t = ts(s)
+    return t if t.tzinfo else t.replace(tzinfo=datetime.timezone.utc)
+
+
+def period(until, hours, past, only_takeovers=False):
+    """The report of the `hours` before `until`; `past`: the period ends before now, so clip the items after it.
+    `only_takeovers`: only the takeover lines (#1703)."""
+    since = until - datetime.timedelta(hours=hours)
+    runs, jobs, status_comments, comments, prs, issues, events = fetch(since, until if past else None)
+    if past:
+        runs, status_comments, comments, prs, issues, events = clip(until, runs, status_comments, comments, prs,
+                                                                    issues, events)
+    if only_takeovers:                          # the open PRs too: their branch and ticket
+        return "\n".join(takeover_lines(takeovers(comments, status_comments,
+                                                   prs + api("pulls?state=open&per_page=100"), since)))
+    files_of = {n: [f["filename"] for f in api(f"pulls/{n}/files?per_page=100")] for n in conflicted(comments)}
+    from feedback import fetch as unanswered
+    refs = claim_refs()
+    text = report(since, runs, jobs, status_comments, comments, prs, git_files(), files_of, issues, events,
+                  unanswered(), None if refs is None else review_delays(refs))
+    return text.replace(" UTC", f" UTC until {until:%Y-%m-%d %H:%M} UTC", 1) if past else text
+
+
+def compare(last, before):
+    """The lines of two reports next to each other (#1697): a line of the last period, and under it the line of the
+    period before when it differs (`  before: ...`). Lines pair by their name (the text before the first colon, digit or
+    parenthesis)."""
+    a, b = last.splitlines(), before.splitlines()
+    key = lambda line: re.split(r"[:\d(]", line)[0]
+    out = []
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, [key(x) for x in a], [key(x) for x in b],
+                                                      autojunk=False).get_opcodes():
+        if op == "equal":
+            for x, y in zip(a[i1:i2], b[j1:j2]):
+                out += [x] + [f"  before: {y.strip()}"] * (x != y)
+        else:
+            out += a[i1:i2] + [f"  before: {y.strip()}" for y in b[j1:j2]]
+    return "\n".join(out)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--hours", type=float, default=24)
+    ap.add_argument("--until", type=utc, help="the end of the period (ISO time, UTC, default now): compare two periods")
+    ap.add_argument("--compare", action="store_true", help="also the period before, under each line that differs")
+    ap.add_argument("--takeovers", action="store_true", help="one line for each takeover and its cause (#1703)")
+    a = ap.parse_args(argv)
+    until = a.until or datetime.datetime.now(datetime.timezone.utc)
+    text = period(until, a.hours, bool(a.until), a.takeovers)
+    if a.compare and not a.takeovers:
+        text = compare(text, period(until - datetime.timedelta(hours=a.hours), a.hours, True))
+    print(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
