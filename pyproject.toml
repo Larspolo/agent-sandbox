@@ -1,0 +1,9 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 130
+
+[tool.ruff.lint]
+select = ["F"]        # pyflakes: undefined names, unused variables and imports

@@ -1,0 +1,4 @@
+# Development: tests and lint. numpy: tools/health.py (the fit of the run costs).
+numpy
+pytest>=8
+ruff>=0.6

@@ -1,0 +1,220 @@
+"""The quota usage of the Claude subscription, and the number of runs that uses it (owner request, 2026-10-26).
+
+The aim (owner, 2026-10-26): 90 % of the 5-hour window used 2 hours before its reset, then slower to 98 % at the
+reset, so that each window reaches the limit (#587).
+
+    python3 tools/usage.py              # five_hour 30% (resets 06:30 UTC, 2.0 h) · seven_day 30% ... · target 12 runs
+    python3 tools/usage.py --target     # only the number of runs (rule 4 of the scheduled task)
+    python3 tools/usage.py --json
+    python3 tools/usage.py --sample     # Usage: <now> · usage 30.0% · resets <time> · runs 9 · week 56.0% · release 61.2%
+    python3 tools/usage.py --fire       # the number of runs that the pacer session starts now (skill `pacer`, #566)
+
+BURN and BURN7 (the same for the 7-day window, #1695) are the defaults. When the run reports on the status issue
+have enough `Usage:` lines (at least 5 pairs in the last 24 hours), `tools/health.py` measures the burns from them
+and this tool uses those values (#462).
+
+The CLI reports the usage of the subscription in a `rate_limit_event` of its stream-json output. One tiny Haiku
+call reads it, about 1 s and a few tokens. All runs share one quota, so each run sees the same numbers.
+The pure functions take plain values, so the tests need no network.
+"""
+import argparse
+import datetime
+import json
+import math
+import subprocess
+import sys
+
+from agent_config import CONFIG
+
+BURN = 0.03         # share of the 5-hour quota that one run uses per hour (16 runs used about 50 % per hour, 2026-10-25)
+BURN7 = 0.005       # share of the 7-day quota that one run uses per hour (0.0053 measured on 2026-10-27, #1695)
+MID, MID_LEFT = 0.90, 2.0   # aim: this share is used this many hours before the 5-hour window resets (#587)
+END = 0.98          # aim: this share is used when the 5-hour window resets
+LO, HI = 1, CONFIG.get("pacing", {}).get("max_runs", 16)   # bounds of the number of runs (`agent.toml`, #1706)
+FREE7 = CONFIG.get("pacing", {}).get("week_free", 0.60)   # below this 7-day usage only the 5-hour window counts (owner, 2026-10-27)
+MAX_FIRE = 4        # runs that the pacer starts per cycle: each run needs a few minutes to claim its ticket
+CALL = ["claude", "-p", "Reply with OK.", "--model", "claude-haiku-5-5", "--output-format", "stream-json", "--verbose"]
+
+
+def parse(lines):
+    """{window: (utilization 0..1, resets_at epoch s, status)} from the stream-json lines of the CLI, or {}."""
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("type") == "rate_limit_event":
+            w = (d.get("rate_limit_info") or {}).get("unifiedWindows") or {}
+            return {k: (float(v.get("utilization") or 0), int(v.get("resetsAt") or 0), v.get("status", "")) for k, v in w.items()}
+    return {}
+
+
+def read_usage(timeout=120):
+    r = subprocess.run(CALL, capture_output=True, text=True, timeout=timeout, cwd="/tmp")
+    return parse(r.stdout.splitlines())
+
+
+def target_runs(usage, now, burn=BURN, end=END, lo=LO, hi=HI, mid=MID, mid_left=MID_LEFT, burn7=None, free7=FREE7):
+    """The number of runs that uses `mid` of the 5-hour window `mid_left` hours before its reset, and `end` at the
+    reset, with a guard for the 7-day window. burn7 (the share of the 7-day quota of one run-hour, measured): a week
+    used ahead of the time gets at most the runs that its budget (1 - used) carries to the 7-day reset (#1695). This
+    count can be 0, below `lo`: the week has no budget for a run now, and the budget per hour grows while the reset
+    comes nearer. Without burn7 the count of a week ahead by more than 10 points is half. Below `free7` of the 7-day
+    usage there is no guard: the runs hit the 5-hour limit, not the weekly pace (owner, 2026-10-27)."""
+    if not usage or "five_hour" not in usage:
+        return None
+    used, reset, status = usage["five_hour"]
+    if status == "rejected":
+        return 0
+    left = (reset - now) / 3600
+    if left > mid_left and used < mid:                          # the first 3 hours: fast to `mid`
+        aim, hours = mid, left - mid_left
+    else:                                                       # the last 2 hours: slow to `end`
+        aim, hours = end, left
+    hours = max(hours, 0.25)                                    # the last quarter hour: use what is left
+    n = round(max(aim - used, 0) / hours / burn)
+    if "seven_day" in usage:                                    # do not use the week faster than it passes
+        used7, reset7, status7 = usage["seven_day"]
+        if status7 == "rejected":
+            return 0
+        if used7 < free7:
+            return max(lo, min(hi, n))
+        elapsed = 1 - max(reset7 - now, 0) / (7 * 86400)
+        if burn7 and used7 > elapsed:
+            fit = max(1 - used7, 0) / max((reset7 - now) / 3600, 0.25) / burn7
+            return min(max(lo, min(hi, n)), math.floor(fit))
+        if used7 > elapsed + 0.10:
+            n //= 2
+    return max(lo, min(hi, n))
+
+
+def week_line(usage, now):
+    """The 7-day projection: the points ahead of the time, and when the quota runs out at the mean rate of the week
+    so far (or that it lasts to the reset), for example `week ahead +38 pt · runs out Wed 10:00`. "" without it."""
+    if "seven_day" not in usage:
+        return ""
+    used7, reset7, _ = usage["seven_day"]
+    gone = 7 * 86400 - max(reset7 - now, 0)
+    line = f"week ahead {(used7 - gone / (7 * 86400)) * 100:+.0f} pt"
+    if used7 <= 0 or gone <= 0:
+        return line
+    out = now + (1 - used7) / (used7 / gone)
+    at = datetime.datetime.fromtimestamp(out, datetime.timezone.utc)
+    return line + (f" · runs out {at:%a %H:%M}" if out < reset7 else " · lasts to the reset")
+
+
+def runs_to_start(target, claims, ready, paused, hi=MAX_FIRE):
+    """The number of runs that the pacer starts now: the runs that the target misses, not more than the ready tickets,
+    but 1 when no ticket is ready: that run refills the queue (#609).
+    Runs that the scheduled task starts cannot start other runs (no `fire_trigger`, #566)."""
+    if paused or not target:
+        return 0
+    return max(0, min(target - claims, max(ready, 1), hi))
+
+
+def lane_plan(target, claims, ready, ready_haiku, weight, paused, hi=MAX_FIRE):
+    """(K, H): the runs that the pacer starts now, and the H of them for the Haiku task (#1715, #1727). The target and
+    the claims are in Opus runs, and a Haiku run counts `weight`. The ready `lane:haiku` tickets get Haiku runs first
+    (cheap), then Opus runs take the rest of the target: at most the other ready tickets, but 1 when none is ready
+    (it refills the queue, #609). The pacer starts the H runs on the Opus task when the Haiku task does not exist."""
+    if paused or not target:
+        return 0, 0
+    room = target - claims
+    h = max(0, min(ready_haiku, hi, math.floor(room / weight + 1e-9))) if room > 0 else 0
+    o = max(0, min(math.floor(room - h * weight + 1e-9), max(ready - h, 1), hi - h))
+    return h + o, h
+
+
+def measured_burn7():
+    """The share of the 7-day quota of one run-hour that `tools/health.py` measures from the `Usage:` lines, or None."""
+    try:
+        import health
+        return health.weekly_burn(health.status_comments(), datetime.datetime.now(datetime.timezone.utc))
+    except Exception:                                           # no GitHub access: the old guard
+        return None
+
+
+def measured_burn():
+    """The burn that `tools/health.py` measures from the `Usage:` lines of the status issue, or None."""
+    try:
+        import health
+        return health.measured_burn(health.status_comments(), datetime.datetime.now(datetime.timezone.utc))
+    except Exception:                                           # no GitHub access: use the default
+        return None
+
+
+def sample_line(usage, now, claims, release=None, lanes=None):
+    """The `Usage:` line of a run report, which `tools/health.py` reads: also the 7-day usage and the release percent
+    of all goals (tools/release.py), for the release progress per quota (#899)."""
+    iso = lambda t: f"{datetime.datetime.fromtimestamp(t, datetime.timezone.utc):%Y-%m-%dT%H:%M:%SZ}"
+    used, reset, _ = usage["five_hour"]
+    line = f"Usage: {iso(now)} · usage {used * 100:.1f}% · resets {iso(reset)} · runs {claims}"
+    if "seven_day" in usage:
+        line += f" · week {usage['seven_day'][0] * 100:.1f}%" + ("" if release is None else f" · release {release:.1f}%")
+        line += f" · week resets {iso(usage['seven_day'][1])}"                  # for the dashboard (#1696)
+    return line + "".join(f" · {k} {n}" for k, n in sorted((lanes or {}).items()) if k != "opus" and n)   # (#1727)
+
+
+def release_percent():
+    """The percent of milestone C over all goals (tools/release.py), or None without GitHub access."""
+    try:
+        import release
+        return release.total(release.current())
+    except Exception:
+        return None
+
+
+def describe(usage, now, burn=BURN, burn7=None):
+    out = []
+    for k, (used, reset, status) in sorted(usage.items()):
+        at = datetime.datetime.fromtimestamp(reset, datetime.timezone.utc)
+        out.append(f"{k} {used:.0%} (resets {at:%a %H:%M} UTC, {(reset - now) / 3600:.1f} h, {status})")
+    week = week_line(usage, now) + (f" · burn7 {burn7:.4f}" if burn7 else "")
+    return " · ".join(out + [week] * bool(week)) + f" · burn {burn:.3f} · max {HI} runs · target {target_runs(usage, now, burn, burn7=burn7)} runs"
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--target", action="store_true", help="print only the number of runs")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--sample", action="store_true", help="print the Usage: line for the run report")
+    ap.add_argument("--burn", type=float, help="share of the 5-hour quota per run-hour (default: measured, else BURN)")
+    ap.add_argument("--fire", action="store_true", help="print the number of runs that the pacer starts now")
+    a = ap.parse_args(argv)
+    usage, now = read_usage(), datetime.datetime.now(datetime.timezone.utc).timestamp()
+    if not usage:
+        sys.exit("no rate_limit_event in the CLI output (no subscription, or the CLI changed)")
+    if a.sample:
+        import health
+        t = datetime.datetime.now(datetime.timezone.utc)
+        print(sample_line(usage, now, health.active_claims(t), release_percent(), health.lane_claims(t)))
+        return
+    burn, burn7 = a.burn or measured_burn() or BURN, measured_burn7() or BURN7
+    if a.fire:
+        import dashboard
+        import health
+        open_all = dashboard.pages("issues?state=open")
+        paused = any({dashboard.STATUS, dashboard.PAUSED} <= set(dashboard.labels(i)) for i in open_all)
+        ready = len(dashboard.candidates(open_all))
+        t = datetime.datetime.now(datetime.timezone.utc)
+        lanes = health.lane_claims(t)
+        claims = health.active_claims(t) if lanes is None else sum(lanes.values())
+        weights, source = health.lane_weights(health.status_comments())
+        eq = claims if lanes is None else health.opus_equivalent(claims, lanes, weights)   # in Opus runs (#1727)
+        target = target_runs(usage, now, burn, burn7=burn7)
+        k, h = lane_plan(target, eq, ready, len(dashboard.candidates(open_all, lane="haiku")), weights["haiku"], paused)
+        print(k)
+        print(f"haiku {h}")
+        print(f"{describe(usage, now, burn, burn7)} · claims {claims} ({eq:.2f} Opus runs) · ready {ready} · "
+              f"paused {paused} · weights " + ", ".join(f"{n} {w:.2f} ({source[n]})" for n, w in weights.items()),
+              file=sys.stderr)
+    elif a.target:
+        print(target_runs(usage, now, burn, burn7=burn7))
+    elif a.json:
+        print(json.dumps({"usage": usage, "burn": burn, "burn7": burn7, "target": target_runs(usage, now, burn, burn7=burn7)}))
+    else:
+        print(describe(usage, now, burn, burn7))
+
+
+if __name__ == "__main__":
+    main()
