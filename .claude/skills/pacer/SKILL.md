@@ -20,7 +20,7 @@ So one pacer session starts them. It does no ticket work, it does not comment on
 3. Its second stdout line is `haiku H`: the runs of K that can go to the Haiku lane (#1715). Find the scheduled task
    "agent-sandbox autopilot haiku" with `mcp__claude-code-remote__list_triggers` (at most once per hour; keep its ID in your
    context). When it is there and enabled, call `mcp__claude-code-remote__fire_trigger` H times with its ID, else H = 0.
-   Then call `fire_trigger` K − H times with `trigger_id` `trig_01QTrgkK5PZmqPwQ96rKp3QE` (the Opus task).
+   Then call `fire_trigger` K − H times with `trigger_id` `TODO-TRIGGER-ID` (the Opus task; `/operator` writes the ID of the task "agent-sandbox autopilot" here).
    If the tools are deferred, load them first with ToolSearch (`select:mcp__claude-code-remote__fire_trigger,mcp__claude-code-remote__list_triggers`).
 4. Schedule the next cycle: `mcp__claude-code-remote__send_later`, `delay_minutes` 10, message
    "Pacer cycle: follow .claude/skills/pacer/SKILL.md." Keep only one pending cycle: do not schedule a second one.
